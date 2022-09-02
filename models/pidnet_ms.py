@@ -5,8 +5,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import time
-from .model_utils import BasicBlock, Bottleneck, segmenthead, DAPPM, PAPPM, PagFM, Bag, Light_Bag
+from .model_utils_ms import BasicBlock, Bottleneck, segmenthead, DAPPM, PAPPM, PagFM, Bag, Light_Bag, BCAtt, CoordAtt_ms
 import logging
+import sys
 
 BatchNorm2d = nn.BatchNorm2d
 bn_mom = 0.1
@@ -14,10 +15,10 @@ algc = False
 
 
 
-class PIDNet(nn.Module):
+class PIDNet_ms(nn.Module):
 
     def __init__(self, m=2, n=3, num_classes=19, planes=64, ppm_planes=96, head_planes=128, augment=True):
-        super(PIDNet, self).__init__()
+        super(PIDNet_ms, self).__init__()
         self.augment = augment
         
         # I Branch
@@ -50,10 +51,27 @@ class PIDNet(nn.Module):
         self.pag3 = PagFM(planes * 2, planes)
         self.pag4 = PagFM(planes * 2, planes)
 
+        self.BCF3d = CoordAtt_ms(planes, mode='detail', stage=3)
+        self.BCF3c = CoordAtt_ms(planes, mode='context', stage=3)
+
+        self.BCF4d = CoordAtt_ms(planes, mode='detail', stage=4)
+        self.BCF4c = CoordAtt_ms(planes, mode='context', stage=4)
+
         self.layer3_ = self._make_layer(BasicBlock, planes * 2, planes * 2, m)
         self.layer4_ = self._make_layer(BasicBlock, planes * 2, planes * 2, m)
         self.layer5_ = self._make_layer(Bottleneck, planes * 2, planes * 2, 1)
         
+        self.downsample3 = nn.Sequential(
+                                            nn.Conv2d(planes * 2, planes * 4, kernel_size = 3, stride=2, padding=1),
+                                            BatchNorm2d(planes * 4, momentum=bn_mom),
+                                        )
+        self.downsample4 = nn.Sequential(
+                                            nn.Conv2d(planes * 2, planes * 4, kernel_size = 3, stride=2, padding=1),
+                                            BatchNorm2d(planes *4, momentum=bn_mom),
+                                            nn.ReLU(inplace=True),
+                                            nn.Conv2d(planes * 4, planes * 8, kernel_size=3, stride=2, padding=1),
+                                            BatchNorm2d(planes * 8),
+                                        )
         # D Branch
         if m == 2:
             self.layer3_d = self._make_single_layer(BasicBlock, planes * 2, planes)
@@ -138,33 +156,56 @@ class PIDNet(nn.Module):
         width_output = x.shape[-1] // 8
         height_output = x.shape[-2] // 8
 
+        
+        #Stage 1,2
         x = self.conv1(x)
         x = self.layer1(x)
         x = self.relu(self.layer2(self.relu(x)))
-        x_ = self.layer3_(x)
-        x_d = self.layer3_d(x)
+
+        #Stage 3
+        x_ = self.layer3_(x) # detail-stage3
         
-        x = self.relu(self.layer3(x))
-        x_ = self.pag3(x_, self.compression3(x))
+        x_d = self.layer3_d(x) # boundary-stage3
+        
+        x = self.relu(self.layer3(x)) # context-stage3
+        
+
+        x_ = self.BCF3d(x= x_, y= x_d) # Detail = BCF(detail+boundary) stage 3-4
+        x = self.BCF3c(x , x_d) # Context = BCF(context+boundry) stage3-4
+        x = x + self.downsample3(x_) # context = context + detail'
+        x_ = x_ + F.interpolate(
+                        self.compression3(x), 
+                        size=[height_output, width_output], 
+                        mode='bilinear', align_corners=False) # detail = detail + context'
         x_d = x_d + F.interpolate(
                         self.diff3(x),
                         size=[height_output, width_output],
-                        mode='bilinear', align_corners=algc)
+                        mode='bilinear', align_corners=algc) # boundary = boundary + context'
         if self.augment:
             temp_p = x_
         
-        x = self.relu(self.layer4(x))
-        x_ = self.layer4_(self.relu(x_))
-        x_d = self.layer4_d(self.relu(x_d))
+        #Stage 4
+        x = self.relu(self.layer4(x)) # context-stage4
         
-        x_ = self.pag4(x_, self.compression4(x))
+        x_ = self.layer4_(self.relu(x_)) # detail-stage4
+        
+        x_d = self.layer4_d(self.relu(x_d)) #boundary- stage4
+        
+        x_ = self.BCF4d(x_ , x_d) # Detail = BCF(detail+boundary) stage4-5
+        x = self.BCF4c(x, x_d) # Context = BCF(context+boundary) stage4-5
+        x = x + self.downsample4(x_) # context = context + detail'
+        x_ = x_ + F.interpolate(
+                        self.compression4(x),
+                        size = [height_output, width_output],
+                        mode = 'bilinear', align_corners = False) # detail = detail + context'
         x_d = x_d + F.interpolate(
                         self.diff4(x),
                         size=[height_output, width_output],
                         mode='bilinear', align_corners=algc)
         if self.augment:
             temp_d = x_d
-            
+        
+        #Stage 5
         x_ = self.layer5_(self.relu(x_))
         x_d = self.layer5_d(self.relu(x_d))
         x = F.interpolate(
@@ -181,14 +222,14 @@ class PIDNet(nn.Module):
         else:
             return x_      
 
-def get_seg_model(cfg, imgnet_pretrained):
+def get_seg_model_ms(cfg, imgnet_pretrained):
     
     if 's' in cfg.MODEL.NAME:
-        model = PIDNet(m=2, n=3, num_classes=cfg.DATASET.NUM_CLASSES, planes=32, ppm_planes=96, head_planes=128, augment=True)
+        model = PIDNet_ms(m=2, n=3, num_classes=cfg.DATASET.NUM_CLASSES, planes=32, ppm_planes=96, head_planes=128, augment=True)
     elif 'm' in cfg.MODEL.NAME:
-        model = PIDNet(m=2, n=3, num_classes=cfg.DATASET.NUM_CLASSES, planes=64, ppm_planes=96, head_planes=128, augment=True)
+        model = PIDNet_ms(m=2, n=3, num_classes=cfg.DATASET.NUM_CLASSES, planes=64, ppm_planes=96, head_planes=128, augment=True)
     else:
-        model = PIDNet(m=3, n=4, num_classes=cfg.DATASET.NUM_CLASSES, planes=64, ppm_planes=112, head_planes=256, augment=True)
+        model = PIDNet_ms(m=3, n=4, num_classes=cfg.DATASET.NUM_CLASSES, planes=64, ppm_planes=112, head_planes=256, augment=True)
     
     if imgnet_pretrained:
         pretrained_state = torch.load(cfg.MODEL.PRETRAINED, map_location='cpu')['state_dict'] 
@@ -215,14 +256,14 @@ def get_seg_model(cfg, imgnet_pretrained):
     
     return model
 
-def get_pred_model(name, num_classes):
+def get_pred_model_ms(name, num_classes):
     
     if 's' in name:
-        model = PIDNet(m=2, n=3, num_classes=num_classes, planes=32, ppm_planes=96, head_planes=128, augment=False)
+        model = PIDNet_ms(m=2, n=3, num_classes=num_classes, planes=32, ppm_planes=96, head_planes=128, augment=False)
     elif 'm' in name:
-        model = PIDNet(m=2, n=3, num_classes=num_classes, planes=64, ppm_planes=96, head_planes=128, augment=False)
+        model = PIDNet_ms(m=2, n=3, num_classes=num_classes, planes=64, ppm_planes=96, head_planes=128, augment=False)
     else:
-        model = PIDNet(m=3, n=4, num_classes=num_classes, planes=64, ppm_planes=112, head_planes=256, augment=False)
+        model = PIDNet_ms(m=3, n=4, num_classes=num_classes, planes=64, ppm_planes=112, head_planes=256, augment=False)
     
     return model
 
@@ -230,9 +271,9 @@ if __name__ == '__main__':
     
     # Comment batchnorms here and in model_utils before testing speed since the batchnorm could be integrated into conv operation
     # (do not comment all, just the batchnorm following its corresponding conv layer)
-    device = torch.device('cuda:0')
-    #model = get_pred_model(name='pidnet_s', num_classes=19)
-    model = get_pred_model(name='pidnet_l', num_classes=19)
+    sys.path.append('/home/mvpserverfive/minseok/PIDNet/models/')
+    device = torch.device('cuda')
+    model = get_pred_model_ms(name='pidnet_s', num_classes=19)
     model.eval()
     model.to(device)
     iterations = None
