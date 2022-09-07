@@ -38,6 +38,17 @@ colormap[16] = torch.tensor([0, 80, 100])
 colormap[17] = torch.tensor([0, 0, 230])
 colormap[18] = torch.tensor([119, 11, 32])
 
+bd_colormap = torch.zeros(9,3).to(device)
+bd_colormap[1] = torch.tensor([255,255,255]) #흰색   0~0.2
+bd_colormap[2] = torch.tensor([192,192,192]) #회색 0.2~0.5
+bd_colormap[3] = torch.tensor([102,255,178]) #연두색 0.5~0.8
+bd_colormap[4] = torch.tensor([255,153,51]) #파랑색 (Boundary로 예측중 GT가 아닌 것)
+bd_colormap[5] = torch.tensor([0,0,255]) #빨간색 GT!=BD pred(완전히 포착을 못함)
+bd_colormap[6] = torch.tensor([0,128,255]) #주황색 (심하게 덜 예측)
+bd_colormap[7] = torch.tensor([255,0,255]) #핑크색 (덜 예측)
+bd_colormap[8] = torch.tensor([0,0,0]) # 검은색 GT= BD pred
+
+label_pred_colormap = torch.zeros(3,1024,2048)
 def parse_args():
     parser = argparse.ArgumentParser(description='Train segmentation network')
     
@@ -117,11 +128,11 @@ testloader = torch.utils.data.DataLoader(
     pin_memory=False)
 
 imgnet = 'imagenet' in config.MODEL.PRETRAINED
-model = models.pidnet.PIDNet(m=2, n=3, num_classes= config.DATASET.NUM_CLASSES, planes=32, ppm_planes=96, head_planes=128, augment=True).to(device)
+model = models.pidnet_bcf2.PIDNet_bcf2(m=2, n=3, num_classes= config.DATASET.NUM_CLASSES, planes=32, ppm_planes=96, head_planes=128, augment=True).to(device)
 
 
-#model_state_file = os.path.join('/home/mvpserverfive/minseok/PIDNet/output/cityscapes/pidnet_small_cityscapes/', 'best.pt')
-model_state_file = os.path.join('/home/mvpserverfive/minseok/PIDNet/output/cityscapes/pidnet_small_cityscapes_trainval/', 'best.pt')
+model_state_file = os.path.join('/home/mvpserverfive/minseok/PIDNet/output/cityscapes/pidnet_small_cityscapes/', 'final_state.pt')
+#model_state_file = os.path.join('/home/mvpserverfive/minseok/PIDNet/output/cityscapes/pidnet_small_cityscapes_trainval/', 'best.pt')
 if os.path.isfile(model_state_file):
     print(1)
     checkpoint = torch.load(model_state_file, map_location=torch.device('cpu'))
@@ -148,6 +159,8 @@ for i_iter, batch in enumerate(testloader, 0):
 
     pred_colormap = torch.zeros((3,1024,2048)).to(device)
     label_colormap = torch.zeros_like(pred_colormap).to(device)
+    boundary_map = torch.zeros((3,1024,2048)).to(device)
+    bdmap = torch.zeros((1,1024,2048)).to(device)
     '''
     for x_index, x_value in enumerate(output_pred[0],0):
         for y_index, y_value in enumerate(x_value, 0):
@@ -164,6 +177,25 @@ for i_iter, batch in enumerate(testloader, 0):
         label_colormap[1,label[0]==k]=colormap[k][1]
         label_colormap[2,label[0]==k]=colormap[k][2]
 
+    label_colormap_np = label_colormap.permute(1,2,0)
+    label_colormap_np = label_colormap_np.cpu().detach().numpy()
+    label_colormap_filename = "/home/mvpserverfive/minseok/PIDNet/visualize/label/label_color_%d.png" %i_iter
+    
+    label_pred_colormap = label_colormap
+    label_pred_colormap[0,label[0]!=output_pred[0]]= 255
+    label_pred_colormap[1,label[0]!=output_pred[0]] = 255
+    label_pred_colormap[2, label[0]!=output_pred[0]] = 255
+    label_pred_colormap[0,label[0]==255]=0
+    label_pred_colormap[1,label[0]==255]=0
+    label_pred_colormap[2,label[0]==255]=0
+    
+    #print(label_pred_colormap)
+    label_pred_colormap = label_pred_colormap.permute(1,2,0)
+    label_pred_colormap =label_pred_colormap.cpu().detach().numpy()
+    label_pred_colormap_filename = "/home/mvpserverfive/minseok/PIDNet/visualize/label_pred/label_pred_color_%d.png" %i_iter
+    cv2.imwrite(label_pred_colormap_filename, label_pred_colormap)
+    
+
     image = image[0].permute(1,2,0)
     image = image.cpu().detach().numpy()
     image_filename = "/home/mvpserverfive/minseok/PIDNet/visualize/img/img_%d.png" %i_iter
@@ -172,27 +204,41 @@ for i_iter, batch in enumerate(testloader, 0):
     pred_colormap = pred_colormap.cpu().detach().numpy()
     pred_colormap_filename = "/home/mvpserverfive/minseok/PIDNet/visualize/pred/pred_color_%d.png" %i_iter
 
-    label_colormap = label_colormap.permute(1,2,0)
-    label_colormap = label_colormap.cpu().detach().numpy()
-    label_colormap_filename = "/home/mvpserverfive/minseok/PIDNet/visualize/label/label_color_%d.png" %i_iter
-
+    cv2.imwrite(label_colormap_filename, label_colormap_np)
     cv2.imwrite(image_filename, image)
     cv2.imwrite(pred_colormap_filename, pred_colormap)
-    cv2.imwrite(label_colormap_filename, label_colormap)
+    
     
     boundary_upsize = F.interpolate(boundary_pred, size=[1024,2048], mode='bilinear', align_corners= False)
-    boundary_output = F.sigmoid(boundary_upsize) * 255
-    boundary_output = boundary_output[0].view(1,1024,2048).permute(1,2,0)
-    bd_gts = bd_gts * 255
-    bd_gts = bd_gts[0].view(1,1024,2048).permute(1,2,0)
+    boundary_output = F.sigmoid(boundary_upsize)
+    print('x',boundary_output.size())
+    boundary_output=boundary_output[0]
+    print('y',bd_gts.size())
+    bd_gts=bd_gts[0].unsqueeze(dim=0)
+    print('x',boundary_output.size())
+    print('y',bd_gts.size())
+    bdmap[boundary_output<0.2]=1 #흰색
+    bdmap[boundary_output>0.2]=2 #주황색
+    bdmap[boundary_output>0.5]=3 #초록색
+    bdmap[boundary_output>0.8]=4 #파란색 (0.8이상이지만 GT가 아닌것)
+    bdmap[(bdmap*bd_gts)==1]=5 #빨간색 (GT중 0.2 이하로 예측)
+    bdmap[(bdmap*bd_gts)==2]=6 #검은색 (GT중 0.2~0.5로 예측)
+    bdmap[(bdmap*bd_gts)==3]=7 #보라색 (GT중 0.5~0.8로 예측)
+    bdmap[(bdmap*bd_gts)==4]=8 #검은색 (잘 예측)
     
-    boundary_output = boundary_output.cpu().detach().numpy()
-    bd_gts = bd_gts.cpu().detach().numpy()
     
-    boundary_output_filename = "/home/mvpserverfive/minseok/PIDNet/visualize/boundary_output/boundary_output_%d.png" %i_iter
-    boundary_gt_filename = '/home/mvpserverfive/minseok/PIDNet/visualize/boundary_gt/boundary_gt_%d.png' %i_iter
-    cv2.imwrite(boundary_output_filename, boundary_output)
-    cv2.imwrite(boundary_gt_filename, bd_gts)
+    # 0.2이하 = 흰색 / 0.2~0.5= 주황색/ 0.5~0.8=초록색 / 0.8~1 = 하늘색 / GT=검은색
+    for k in range(1,9):
+        boundary_map[0,bdmap[0]==k]=bd_colormap[k][0]
+        boundary_map[1,bdmap[0]==k]=bd_colormap[k][1]
+        boundary_map[2,bdmap[0]==k]=bd_colormap[k][2]
+
+    boundary_map = boundary_map.permute(1,2,0)
+    boundary_map = boundary_map.cpu().detach().numpy()
+    boundary_map_filename = "/home/mvpserverfive/minseok/PIDNet/visualize/boundary_map/boundary_map_%d.png" %i_iter
+    cv2.imwrite(boundary_map_filename, boundary_map)
+    
+    
 
     
 
