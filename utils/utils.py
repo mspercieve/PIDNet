@@ -46,7 +46,8 @@ class FullModel(nn.Module):
                 h, w), mode='bilinear', align_corners=config.MODEL.ALIGN_CORNERS)
 
     acc  = self.pixel_acc(outputs[-2], labels)
-    loss_s = self.sem_loss(outputs[:-1], labels)
+    #loss_s = self.sem_loss(outputs[:-1], labels)
+    loss_s = self.sem_loss(outputs[-2], labels)
     loss_b = self.bd_loss(outputs[-1], bd_gt)
 
     filler = torch.ones_like(labels) * config.TRAIN.IGNORE_LABEL
@@ -126,6 +127,42 @@ def create_logger(cfg, cfg_name, phase='train'):
 
     return logger, str(final_output_dir), str(tensorboard_log_dir)
 
+
+
+def get_confusion_matrix(label, pred, size, num_class, ignore=-1):
+    """
+    Calcute the confusion matrix by given label and pred in cuda
+    """
+    output = pred.permute(0, 2, 3, 1)
+    seg_pred = torch.argmax(pred, dim=1).byte()
+    seg_gt = label[:,:size[-2], :size[-1]].int()
+
+    ignore_index = seg_gt != ignore
+    seg_gt = seg_gt[ignore_index]
+    seg_pred = seg_pred[ignore_index]
+
+    index = (seg_gt * num_class + seg_pred)
+    label_count = torch.bincount(index)
+    confusion_matrix = torch.zeros((num_class, num_class), device=output.device).long()
+
+    #i_label, i_pred = torch.divmod(torch.arange(len(label_count)), num_class)
+    i_label = torch.floor(torch.div(torch.arange(len(label_count), device=output.device), num_class)).long()
+    i_pred = torch.remainder(torch.arange(len(label_count), device=output.device), num_class).long()
+    valid = torch.arange(len(label_count), device=output.device) < len(label_count)
+    confusion_matrix[i_label[valid], i_pred[valid]] = label_count[valid]      
+    confusion_matrix = confusion_matrix.cpu().numpy()
+    return confusion_matrix
+
+
+def adjust_learning_rate(optimizer, base_lr, max_iters, 
+        cur_iters, power=0.9, nbb_mult=10):
+    lr = base_lr*((1-float(cur_iters)/max_iters)**(power))
+    optimizer.param_groups[0]['lr'] = lr
+    if len(optimizer.param_groups) == 2:
+        optimizer.param_groups[1]['lr'] = lr * nbb_mult
+    return lr
+
+'''
 def get_confusion_matrix(label, pred, size, num_class, ignore=-1):
     """
     Calcute the confusion matrix by given label and pred
@@ -149,12 +186,10 @@ def get_confusion_matrix(label, pred, size, num_class, ignore=-1):
             if cur_index < len(label_count):
                 confusion_matrix[i_label,
                                  i_pred] = label_count[cur_index]
+    #i_label, i_pred = np.divmod(np.arange(len(label_count)), num_class)
+    #valid = np.arange(len(label_count)) < len(label_count)
+    #confusion_matrix[i_label[valid], i_pred[valid]] = label_count[valid]      
+
     return confusion_matrix
 
-def adjust_learning_rate(optimizer, base_lr, max_iters, 
-        cur_iters, power=0.9, nbb_mult=10):
-    lr = base_lr*((1-float(cur_iters)/max_iters)**(power))
-    optimizer.param_groups[0]['lr'] = lr
-    if len(optimizer.param_groups) == 2:
-        optimizer.param_groups[1]['lr'] = lr * nbb_mult
-    return lr
+'''

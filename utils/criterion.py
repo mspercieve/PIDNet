@@ -61,7 +61,7 @@ class OhemCrossEntropy(nn.Module):
         return loss
 
     def _ohem_forward(self, score, target, **kwargs):
-
+        #print(score)
         pred = F.softmax(score, dim=1)
         pixel_losses = self.criterion(score, target).contiguous().view(-1)
         mask = target.contiguous().view(-1) != self.ignore_label
@@ -97,6 +97,28 @@ class OhemCrossEntropy(nn.Module):
         
         else:
             raise ValueError("lengths of prediction and target are not identical!")
+'''
+class OhemCrossEntropy(nn.Module):
+
+    def __init__(self, thres=0.7, n_min=500, ignore_label=-1, *args, **kwargs):
+        super(OhemCrossEntropy, self).__init__()
+        self.thresh = -torch.log(torch.tensor(thres, dtype=torch.float)).cuda()
+        self.n_min = n_min
+        self.ignore_label = ignore_label
+        self.criteria = nn.CrossEntropyLoss(ignore_index=ignore_label, reduction='none')
+
+    def forward(self, logits, labels):
+        #N, C, H, W = logits.size()
+        print(logits)
+        loss = self.criteria(logits, labels).view(-1)
+        loss, _ = torch.sort(loss, descending=True)
+        if loss[self.n_min] > self.thresh:
+            loss = loss[loss>self.thresh]
+        else:
+            loss = loss[:self.n_min]
+        return torch.mean(loss)
+'''
+
 
 
 def weighted_bce(bd_pre, target):

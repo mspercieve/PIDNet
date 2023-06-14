@@ -13,10 +13,13 @@ import numpy as np
 
 import torch
 import torch.nn as nn
-import torch.backends.cudnn as cudnn
+# import torch.backends.cudnn as cudnn
 import torch.optim
 from tensorboardX import SummaryWriter
-
+import wandb
+import time
+import sys
+print(sys.path)
 import _init_paths
 import models
 import datasets
@@ -47,8 +50,11 @@ def parse_args():
 
 
 def main():
+    
     args = parse_args()
+    tm = time.localtime(time.time())
 
+    #wandb.init(project="Realtime Seg", entity="msperceive", name="s1-{}_{}/{}-{}:{}".format(config.MODEL.VERSION,tm.tm_mon, tm.tm_mday, tm.tm_hour, tm.tm_min))
     if args.seed > 0:
         import random
         print('Seeding with', args.seed)
@@ -68,18 +74,18 @@ def main():
     }
 
     # cudnn related setting
-    cudnn.benchmark = config.CUDNN.BENCHMARK
-    cudnn.deterministic = config.CUDNN.DETERMINISTIC
-    cudnn.enabled = config.CUDNN.ENABLED
+    # cudnn.benchmark = config.CUDNN.BENCHMARK
+    # cudnn.deterministic = config.CUDNN.DETERMINISTIC
+    # cudnn.enabled = config.CUDNN.ENABLED
     gpus = list(config.GPUS)
     if torch.cuda.device_count() != len(gpus):
-        print("The gpu numbers do not match!")
-        return 0
+       print("The gpu numbers do not match!")
+       return 0
     
     imgnet = 'imagenet' in config.MODEL.PRETRAINED
-    model = models.pidnet.get_seg_model(config, imgnet_pretrained=imgnet)
- 
-    batch_size = config.TRAIN.BATCH_SIZE_PER_GPU * len(gpus)
+    model = models.pidnet_attn.get_seg_model(config, imgnet_pretrained=imgnet)
+    #batch_size = config.TRAIN.BATCH_SIZE_PER_GPU * len(gpus)
+    batch_size = config.TRAIN.BATCH_SIZE_PER_GPU * len(config.GPUS)
     # prepare data
     crop_size = (config.TRAIN.IMAGE_SIZE[1], config.TRAIN.IMAGE_SIZE[0])
     train_dataset = eval('datasets.'+config.DATASET.DATASET)(
@@ -92,15 +98,14 @@ def main():
                         base_size=config.TRAIN.BASE_SIZE,
                         crop_size=crop_size,
                         scale_factor=config.TRAIN.SCALE_FACTOR)
-
+    
     trainloader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=config.TRAIN.SHUFFLE,
         num_workers=config.WORKERS,
-        pin_memory=False,
+        pin_memory=True,
         drop_last=True)
-
 
     test_size = (config.TEST.IMAGE_SIZE[1], config.TEST.IMAGE_SIZE[0])
     test_dataset = eval('datasets.'+config.DATASET.DATASET)(
@@ -118,7 +123,7 @@ def main():
         batch_size=config.TEST.BATCH_SIZE_PER_GPU * len(gpus),
         shuffle=False,
         num_workers=config.WORKERS,
-        pin_memory=False)
+        pin_memory=True)
 
     # criterion
     if config.LOSS.USE_OHEM:
@@ -126,12 +131,11 @@ def main():
                                         thres=config.LOSS.OHEMTHRES,
                                         min_kept=config.LOSS.OHEMKEEP,
                                         weight=train_dataset.class_weights)
+
     else:
         sem_criterion = CrossEntropy(ignore_label=config.TRAIN.IGNORE_LABEL,
                                     weight=train_dataset.class_weights)
-
     bd_criterion = BondaryLoss()
-    
     model = FullModel(model, sem_criterion, bd_criterion)
     model = nn.DataParallel(model, device_ids=gpus).cuda()
 
@@ -148,9 +152,7 @@ def main():
                                 )
     else:
         raise ValueError('Only Support SGD optimizer')
-
     epoch_iters = int(train_dataset.__len__() / config.TRAIN.BATCH_SIZE_PER_GPU / len(gpus))
-        
     best_mIoU = 0
     last_epoch = 0
     flag_rm = config.TRAIN.RESUME
@@ -165,18 +167,16 @@ def main():
             model.module.model.load_state_dict({k.replace('model.', ''): v for k, v in dct.items() if k.startswith('model.')})
             optimizer.load_state_dict(checkpoint['optimizer'])
             logger.info("=> loaded checkpoint (epoch {})".format(checkpoint['epoch']))
-
     start = timeit.default_timer()
     end_epoch = config.TRAIN.END_EPOCH
     num_iters = config.TRAIN.END_EPOCH * epoch_iters
     real_end = 120+1 if 'camvid' in config.DATASET.TRAIN_SET else end_epoch
-    
     for epoch in range(last_epoch, real_end):
 
-        current_trainloader = trainloader
-        if current_trainloader.sampler is not None and hasattr(current_trainloader.sampler, 'set_epoch'):
-            current_trainloader.sampler.set_epoch(epoch)
-
+        # current_trainloader = trainloader
+        # if current_trainloader.sampler is not None and hasattr(current_trainloader.sampler, 'set_epoch'):
+        #     current_trainloader.sampler.set_epoch(epoch)
+        
         train(config, epoch, config.TRAIN.END_EPOCH, 
                   epoch_iters, config.TRAIN.LR, num_iters,
                   trainloader, optimizer, model, writer_dict)
@@ -184,6 +184,7 @@ def main():
         if flag_rm == 1 or (epoch % 5 == 0 and epoch < real_end - 100) or (epoch >= real_end - 100):
             valid_loss, mean_IoU, IoU_array = validate(config, 
                         testloader, model, writer_dict)
+            #wandb.log({'epoch': epoch, 'val_loss': valid_loss, 'val_mIoU': mean_IoU})
         if flag_rm == 1:
             flag_rm = 0
 
@@ -211,6 +212,7 @@ def main():
 
     writer_dict['writer'].close()
     end = timeit.default_timer()
+    #wandb.finish()
     logger.info('Hours: %d' % np.int((end-start)/3600))
     logger.info('Done')
 

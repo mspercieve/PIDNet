@@ -11,18 +11,18 @@ from tqdm import tqdm
 
 import torch
 from torch.nn import functional as F
+import wandb
 
 from utils.utils import AverageMeter
 from utils.utils import get_confusion_matrix
 from utils.utils import adjust_learning_rate
 
 
-
 def train(config, epoch, num_epoch, epoch_iters, base_lr,
           num_iters, trainloader, optimizer, model, writer_dict):
     # Training
     model.train()
-
+    #wandb.watch(model)
     batch_time = AverageMeter()
     ave_loss = AverageMeter()
     ave_acc  = AverageMeter()
@@ -33,11 +33,12 @@ def train(config, epoch, num_epoch, epoch_iters, base_lr,
     writer = writer_dict['writer']
     global_steps = writer_dict['train_global_steps']
 
+
     for i_iter, batch in enumerate(trainloader, 0):
         images, labels, bd_gts, _, _ = batch
-        images = images.cuda()
-        labels = labels.long().cuda()
-        bd_gts = bd_gts.float().cuda()
+        images = images.cuda(non_blocking=True)
+        labels = labels.long().cuda(non_blocking=True)
+        bd_gts = bd_gts.float().cuda(non_blocking=True)
         
 
         losses, _, acc, loss_list = model(images, labels, bd_gts)
@@ -70,7 +71,8 @@ def train(config, epoch, num_epoch, epoch_iters, base_lr,
                       batch_time.average(), [x['lr'] for x in optimizer.param_groups], ave_loss.average(),
                       ave_acc.average(), avg_sem_loss.average(), avg_bce_loss.average(),ave_loss.average()-avg_sem_loss.average()-avg_bce_loss.average())
             logging.info(msg)
-
+            #wandb.log({"train_loss": ave_loss.average(), "sem_loss": avg_sem_loss.average(), "bce_loss": avg_bce_loss.average(), "SB_loss": ave_loss.average()-avg_sem_loss.average()-avg_bce_loss.average()})
+    
     writer.add_scalar('train_loss', ave_loss.average(), global_steps)
     writer_dict['train_global_steps'] = global_steps + 1
 
@@ -81,12 +83,12 @@ def validate(config, testloader, model, writer_dict):
     confusion_matrix = np.zeros(
         (config.DATASET.NUM_CLASSES, config.DATASET.NUM_CLASSES, nums))
     with torch.no_grad():
-        for idx, batch in enumerate(testloader):
+        for idx, batch in enumerate(tqdm(testloader)):
             image, label, bd_gts, _, _ = batch
             size = label.size()
-            image = image.cuda()
-            label = label.long().cuda()
-            bd_gts = bd_gts.float().cuda()
+            image = image.cuda(non_blocking=True)
+            label = label.long().cuda(non_blocking=True)
+            bd_gts = bd_gts.float().cuda(non_blocking=True)
 
             losses, pred, _, _ = model(image, label, bd_gts)
             if not isinstance(pred, (list, tuple)):
@@ -96,7 +98,7 @@ def validate(config, testloader, model, writer_dict):
                     input=x, size=size[-2:],
                     mode='bilinear', align_corners=config.MODEL.ALIGN_CORNERS
                 )
-
+                conf_time = time.time()
                 confusion_matrix[..., i] += get_confusion_matrix(
                     label,
                     x,
@@ -105,9 +107,7 @@ def validate(config, testloader, model, writer_dict):
                     config.TRAIN.IGNORE_LABEL
                 )
 
-            if idx % 10 == 0:
-                print(idx)
-
+            time.sleep(0.1)
             loss = losses.mean()
             ave_loss.update(loss.item())
 
