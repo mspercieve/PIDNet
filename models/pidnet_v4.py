@@ -142,26 +142,31 @@ class PIDNet_v4(nn.Module):
         #Stage 3
         
 
-        x_ = self.layer3_(x) # detail-stage3    
-
+        x_ = self.layer3_(x) # detail-stage3  
         x_d = self.layer3_d(x) # boundary-stage3
+        x = self.relu(self.layer3(x)) # context-stage3         
+        x_d = x_d + F.interpolate(
+                        self.diff3(x),
+                        size=[height_output, width_output],
+                        mode='bilinear', align_corners=algc)
         
-        x = self.relu(self.layer3(x)) # context-stage3
-
         c_ff3, d_ff3 = self.FSM3(x, x_)
-        x = x + c_ff3 # context = context + detail'
-        x_ = x_ + d_ff3 # detail = detail + context'
+        x = x + c_ff3 # context = context + detail' 
+        x_ = x_ + d_ff3 # detail = detail + context' 
 
         if self.augment:
             temp_p = x_
         
         #Stage 4
         x = self.relu(self.layer4(x)) # context-stage4
-
-        x_ = self.layer4_(self.relu(x_)) # detail-stage4
-
+        x_ = self.layer4_(self.relu(x_)) # detail-stage4 
         x_d = self.layer4_d(self.relu(x_d)) #boundary- stage4
-        
+        x_d = x_d + F.interpolate(
+                        self.diff4(x),
+                        size=[height_output, width_output],
+                        mode='bilinear', align_corners=algc)
+
+
         c_ff4, d_ff4 = self.FSM4(x, x_)
         x = x + c_ff4 # context = context + detail'
         x_ = x_ + d_ff4 # detail = detail + context'
@@ -279,3 +284,125 @@ if __name__ == '__main__':
     
 
 
+class Local2GlobalAttn(nn.Module):
+    def __init__(
+        self,
+        inp,
+        token_dim=128,
+        token_num=6,
+        inp_res=0,
+        norm_pos='post',
+        drop_path_rate=0.
+    ):
+        super(Local2GlobalAttn, self).__init__()
+
+        num_heads = 2
+        self.scale = (inp // num_heads) ** -0.5
+
+        self.q = nn.Linear(token_dim, inp)
+        self.proj = nn.Linear(inp, token_dim)
+        
+        self.layer_norm = nn.LayerNorm(token_dim)
+        self.drop_path = DropPath(drop_path_rate)
+
+
+    def forward(self, x):
+        features, tokens = x
+        bs, C, _, _ = features.shape
+
+        t = self.q(tokens).permute(1, 0, 2) # from T x bs x Ct to bs x T x Ct
+        k = features.view(bs, C, -1)        # bs x C x HW
+        attn = (t @ k) * self.scale
+
+        attn_out = attn.softmax(dim=-1)             # bs x T x HW
+        attn_out = (attn_out @ k.permute(0, 2, 1))  # bs x T x C
+                                                    # note here: k=v without transform
+        t = self.proj(attn_out.permute(1, 0, 2))    #T x bs x C
+
+        tokens = tokens + self.drop_path(t)
+        tokens = self.layer_norm(tokens)
+
+        return tokens
+    
+class Global2Local(nn.Module):
+    def __init__(
+        self,
+        inp,
+        inp_res=0,
+        block_type='mlp',
+        token_dim=128,
+        token_num=6,
+        attn_num_heads=2,
+        use_dynamic=False,
+        drop_path_rate=0.,
+        remove_proj_local=True, 
+    ):
+        super(Global2Local, self).__init__()
+        print(f'G2L: {attn_num_heads} heads, inp: {inp}, token: {token_dim}')
+
+        self.token_num = token_num
+        self.num_heads = attn_num_heads
+        self.block = block_type
+        self.use_dynamic = use_dynamic
+
+        if self.use_dynamic:
+            self.alpha_scale = 2.0
+            self.alpha = nn.Sequential(
+                nn.Linear(token_dim, inp),
+                h_sigmoid(),
+            )
+
+
+        if 'mlp' in self.block:
+            self.mlp = nn.Linear(token_num, inp_res)
+
+        if 'attn' in self.block:
+            self.scale = (inp // attn_num_heads) ** -0.5
+            self.k = nn.Linear(token_dim, inp)
+
+        self.proj = nn.Linear(token_dim, inp)
+        self.drop_path = DropPath(drop_path_rate)
+
+        self.remove_proj_local = remove_proj_local
+        if self.remove_proj_local == False:
+            self.q = nn.Conv2d(inp, inp, 1, 1, 0, bias=False)
+            self.fuse = nn.Conv2d(inp, inp, 1, 1, 0, bias=False)
+ 
+    def forward(self, x):
+        out, tokens = x
+
+        if self.use_dynamic:
+            alp = self.alpha(tokens) * self.alpha_scale
+            v = self.proj(tokens)
+            v = (v * alp).permute(1, 2, 0)
+        else:
+            v = self.proj(tokens).permute(1, 2, 0)  # from T x bs x Ct -> T x bs x C -> bs x C x T 
+
+        bs, C, H, W = out.shape
+        if 'mlp' in self.block:
+            g_sum = self.mlp(v).view(bs, C, H, W)       # bs x C x T -> bs x C x H x W
+
+        if 'attn' in self.block:
+            if self.remove_proj_local:
+                q = out.view(bs, self.num_heads, -1, H*W).transpose(-1, -2)                         # bs x N x HW x C/N
+            else:
+                q = self.q(out).view(bs, self.num_heads, -1, H*W).transpose(-1, -2)                         # bs x N x HW x C/N
+
+            k = self.k(tokens).permute(1, 2, 0).view(bs, self.num_heads, -1, self.token_num)    # from T x bs x Ct -> bs x C x T -> bs x N x C/N x T
+            attn = (q @ k) * self.scale                         # bs x N x HW x T
+
+            attn_out = attn.softmax(dim=-1)                     # bs x N x HW x T
+            
+            vh = v.view(bs, self.num_heads, -1, self.token_num) # bs x N x C/N x T
+            attn_out = (attn_out @ vh.transpose(-1, -2))        # bs x N x HW x C/N
+                                                                # note here k != v
+            g_a = attn_out.transpose(-1, -2).reshape(bs, C, H, W)   # bs x C x HW
+
+            if self.remove_proj_local == False:
+                g_a = self.fuse(g_a)            
+
+            g_sum = g_sum + g_a if 'mlp' in self.block else g_a
+
+        out = out + self.drop_path(g_sum)
+
+        return out

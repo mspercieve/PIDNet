@@ -1,14 +1,44 @@
 # ------------------------------------------------------------------------------
 # Written by Jiacong Xu (jiacong.xu@tamu.edu)
 # ------------------------------------------------------------------------------
-from unittest import result
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange, repeat
+import torchvision
 
 BatchNorm2d = nn.BatchNorm2d
 bn_mom = 0.1
 algc = False
+
+
+def weight_init(module):
+    for n, m in module.named_children():
+        if isinstance(m, nn.Conv2d):
+            nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, (nn.BatchNorm2d, nn.InstanceNorm2d, nn.GroupNorm)):
+            if m.weight is None:
+                pass
+            elif m.bias is not None:
+                nn.init.zeros_(m.bias)
+            else:
+                nn.init.ones_(m.weight)
+        elif isinstance(m, nn.Linear):
+            nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.Sequential):
+            weight_init(m)
+        elif isinstance(m, (nn.ReLU, nn.ReLU6, nn.Upsample, nn.Parameter, nn.AdaptiveAvgPool2d, nn.Sigmoid)):
+            pass
+        else:
+            try:
+                m.initialize()
+            except:
+                pass
+
 
 class BasicBlock(nn.Module):
     expansion = 1
@@ -45,6 +75,9 @@ class BasicBlock(nn.Module):
             return out
         else:
             return self.relu(out)
+
+    def initialize(self):
+        weight_init(self)
 
 class Bottleneck(nn.Module):
     expansion = 2
@@ -87,6 +120,9 @@ class Bottleneck(nn.Module):
         else:
             return self.relu(out)
 
+    def initialize(self):
+        weight_init(self)
+
 class segmenthead(nn.Module):
 
     def __init__(self, inplanes, interplanes, outplanes, scale_factor=None):
@@ -111,6 +147,9 @@ class segmenthead(nn.Module):
                         mode='bilinear', align_corners=algc)
 
         return out
+
+    def initialize(self):
+        weight_init(self)
 
 class DAPPM(nn.Module):
     def __init__(self, inplanes, branch_planes, outplanes, BatchNorm=nn.BatchNorm2d):
@@ -194,6 +233,9 @@ class DAPPM(nn.Module):
         out = self.compression(torch.cat(x_list, 1)) + self.shortcut(x)
         return out 
     
+    def initialize(self):
+        weight_init(self)
+    
 class PAPPM(nn.Module):
     def __init__(self, inplanes, branch_planes, outplanes, BatchNorm=nn.BatchNorm2d):
         super(PAPPM, self).__init__()
@@ -265,6 +307,186 @@ class PAPPM(nn.Module):
         out = self.compression(torch.cat([x_,scale_out], 1)) + self.shortcut(x)
         return out
     
+    def initialize(self):
+        weight_init(self)
+
+class Global2Local(nn.Module):
+    def __init__(self, stage, num_head, planes, dim):
+        super(Global2Local, self).__init__()
+        self.stage = stage
+        self.num_head = num_head
+        self.planes = planes
+        self.dim = dim
+        
+        if self.stage == 3:
+            kv_dim = planes * 4
+        elif self.stage==4:
+            kv_dim = planes * 8
+        else:
+            assert self.stage == 3 or self.stage ==4, 'stage must be 3 or 4'
+        
+        self.q = nn.Conv2d(2*planes, dim, 1)
+        self.k = nn.Conv2d(kv_dim, dim, 1)
+        self.v = nn.Conv2d(kv_dim, dim, 1)
+        self.fuse = nn.Sequential(
+                                nn.Conv2d(dim, 2*planes, 1),
+                                nn.BatchNorm2d(2*planes),
+                                nn.ReLU(inplace=True))
+        
+        self.scale = (dim // num_head) ** -0.5
+        
+    def forward(self, context, detail):
+        b, _, h, w = detail.shape
+        
+        v = rearrange(self.v(context) , 'b (n c) h w -> b n (h w) c', n=self.num_head)
+        k = rearrange(self.k(context) , 'b (n c) h w -> b n c (h w)', n=self.num_head)
+        
+        q = rearrange(self.q(detail) , 'b (n c) h w -> b n (h w) c', n=self.num_head)
+
+        attn = q@k * self.scale
+        attn = attn.softmax(dim=-1)
+
+        attn_out = attn @ v
+        attn_out = rearrange(attn_out, 'b n (h w) c -> b (n c) h w', h=h, w=w )
+        
+        attn_out = self.fuse(attn_out)
+        out = detail + attn_out
+        return out
+    
+    def initialize(self):
+        weight_init(self)
+    
+class External_Attention(nn.Module):
+    def __init__(self, in_ch, out_ch, inter_ch, attn_dim, num_head):
+        super(External_Attention, self).__init__()
+        self.in_ch = in_ch
+        self.out_ch = out_ch
+        self.inter_ch = inter_ch
+        self.num_head = num_head
+        
+        self.to_q = nn.Conv2d(in_ch, inter_ch, 1)
+        self.k = nn.Parameter(torch.randn(num_head, inter_ch//num_head, attn_dim), requires_grad=True)
+        self.v = nn.Parameter(torch.randn(num_head, inter_ch//num_head, attn_dim), requires_grad=True)
+        self.scale = (inter_ch//num_head) ** -0.5
+        self.layer_norm = nn.LayerNorm(inter_ch)
+        self.batch_norm = nn.BatchNorm2d(out_ch)
+        self.out_conv = nn.Sequential(
+            nn.Conv2d(inter_ch, out_ch, 1),
+            nn.BatchNorm2d(out_ch),
+            nn.GELU(),
+        )
+
+    def forward(self, x):
+        
+        b, c, h, w = x.shape
+        q = self.to_q(x)
+        q = rearrange(q, 'b (n c) h w -> (b n) (h w) c', n=self.num_head)
+        k = self.k.repeat(b, 1, 1)
+        v = self.v.repeat(b, 1, 1)
+        v = rearrange(v, 'b c d -> b d c')
+
+        attn = q@k * self.scale
+        attn = attn.softmax(dim=-1)
+
+        attn_out = attn @ v
+        attn_out = rearrange(attn_out, '(b n) (h w) c -> b (n c) h w', b=b, h=h, w=w, n=self.num_head)
+        attn_out = self.out_conv(attn_out)
+        return attn_out
+    
+    def initialize(self):
+        weight_init(self)
+
+class DeformableConv2d(nn.Module):
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 kernel_size=3,
+                 stride=1,
+                 padding=1,
+                 dilation=1,
+                 bias=False):
+        super(DeformableConv2d, self).__init__()
+
+        assert type(kernel_size) == tuple or type(kernel_size) == int
+
+        kernel_size = kernel_size if type(kernel_size) == tuple else (kernel_size, kernel_size)
+        self.stride = stride if type(stride) == tuple else (stride, stride)
+        self.padding = padding
+        self.dilation = dilation
+
+        self.offset_conv = nn.Conv2d(in_channels,
+                                     2 * kernel_size[0] * kernel_size[1],
+                                     kernel_size=kernel_size,
+                                     stride=stride,
+                                     padding=self.padding,
+                                     dilation=self.dilation,
+                                     bias=True)
+
+        nn.init.constant_(self.offset_conv.weight, 0.)
+        nn.init.constant_(self.offset_conv.bias, 0.)
+
+        self.modulator_conv = nn.Conv2d(in_channels,
+                                        1 * kernel_size[0] * kernel_size[1],
+                                        kernel_size=kernel_size,
+                                        stride=stride,
+                                        padding=self.padding,
+                                        dilation=self.dilation,
+                                        bias=True)
+
+        nn.init.constant_(self.modulator_conv.weight, 0.)
+        nn.init.constant_(self.modulator_conv.bias, 0.)
+
+        self.regular_conv = nn.Conv2d(in_channels=in_channels,
+                                      out_channels=out_channels,
+                                      kernel_size=kernel_size,
+                                      stride=stride,
+                                      padding=self.padding,
+                                      dilation=self.dilation,
+                                      bias=bias)
+
+        self.batchnorm2d = nn.BatchNorm2d(out_channels)
+        self.gelu = nn.GELU()
+    def forward(self, x):
+        # we can add edge when creating offset
+        # h, w = x.shape[2:]
+        # max_offset = max(h, w)/4.
+
+        offset = self.offset_conv(x)  # .clamp(-max_offset, max_offset)
+        modulator = 2. * torch.sigmoid(self.modulator_conv(x))
+        # op = (n - (k * d - 1) + 2p / s)
+        x = torchvision.ops.deform_conv2d(input=x,
+                                          offset=offset,
+                                          weight=self.regular_conv.weight,
+                                          bias=self.regular_conv.bias,
+                                          padding=self.padding,
+                                          mask=modulator,
+                                          stride=self.stride,
+                                          dilation=self.dilation)
+        x = self.batchnorm2d(x)
+        x = self.gelu(x)
+        return x
+    
+    def initialize(self):
+        weight_init(self)
+
+class Detail_Attn(nn.Module):
+    def __init__(self, in_ch, out_ch, inter_ch, attn_dim, num_head, kernel_size=3, stride=1, padding=1, dilation=1):
+        super(Detail_Attn, self).__init__()
+        self.in_ch = in_ch
+        self.out_ch = out_ch
+        self.inter_ch = inter_ch
+        self.num_head = num_head
+        
+        self.ext_attn = External_Attention(in_ch, out_ch, inter_ch, attn_dim, num_head)
+        self.dcn = DeformableConv2d(in_ch, out_ch, kernel_size, stride, padding, dilation)
+
+    def forward(self, context, detail):
+        attn_out = self.ext_attn(detail)
+        dcn_out = self.dcn(context)
+        return attn_out + dcn_out + detail
+    
+    def initialize(self):
+        weight_init(self)
 
 class PagFM(nn.Module):
     def __init__(self, in_channels, mid_channels, after_relu=False, with_channel=False, BatchNorm=nn.BatchNorm2d):
@@ -311,129 +533,9 @@ class PagFM(nn.Module):
         x = (1-sim_map)*x + sim_map*y
         
         return x
-
-
-class AddCoords(nn.Module):
-
-    def __init__(self, with_r=False):
-        super().__init__()
-        self.with_r = with_r
-
-    def forward(self, input_tensor):
-        """
-        Args:
-            input_tensor: shape(batch, channel, x_dim, y_dim)
-        """
-        batch_size, _, x_dim, y_dim = input_tensor.size()
-
-        xx_channel = torch.arange(x_dim).repeat(1, y_dim, 1)
-        yy_channel = torch.arange(y_dim).repeat(1, x_dim, 1).transpose(1, 2)
-
-        xx_channel = xx_channel.float() / (x_dim - 1)
-        yy_channel = yy_channel.float() / (y_dim - 1)
-
-        xx_channel = xx_channel * 2 - 1
-        yy_channel = yy_channel * 2 - 1
-
-        xx_channel = xx_channel.repeat(batch_size, 1, 1, 1).transpose(2, 3)
-        yy_channel = yy_channel.repeat(batch_size, 1, 1, 1).transpose(2, 3)
-
-        ret = torch.cat([
-            input_tensor,
-            xx_channel.type_as(input_tensor),
-            yy_channel.type_as(input_tensor)], dim=1)
-
-        if self.with_r:
-            rr = torch.sqrt(torch.pow(xx_channel.type_as(input_tensor) - 0.5, 2) + torch.pow(yy_channel.type_as(input_tensor) - 0.5, 2))
-            ret = torch.cat([ret, rr], dim=1)
-
-        return ret
-
-class CoordConv(nn.Module):
-
-    def __init__(self, in_channels, out_channels, with_r=False, **kwargs):
-        super().__init__()
-        self.addcoords = AddCoords(with_r=with_r)
-        in_size = in_channels+2
-        if with_r:
-            in_size += 1
-        self.conv = nn.Conv2d(in_size, out_channels, **kwargs)
-
-    def forward(self, x):
-        ret = self.addcoords(x)
-        ret = self.conv(ret)
-        return ret
-
-class C_BCF(nn.Module):
-    def __init__(self, planes, stage, BatchNorm=nn.BatchNorm2d):
-        super(C_BCF, self).__init__()
-        
-        self.addcoords = AddCoords( with_r = False)
-
-        if stage == 3:
-            self.conv_resize = nn.Sequential(
-                                        nn.Conv2d(planes*4, planes*2, kernel_size=1, stride=1, padding=0, bias=False),
-                                        BatchNorm(planes*2),
-                                        nn.ReLU(inplace=True)
-                                        )
-            self.h_size = 2
-            self.w_size = 2
-
-            self.conv_bcf = nn.Sequential(
-                                        nn.Conv2d(planes*3 + 2, planes*2, kernel_size=1, stride=1, padding=0, bias=False),
-                                        BatchNorm(planes*2)
-            )
-        else:
-            self.conv_resize = nn.Sequential(
-                                        nn.Conv2d(planes*8, planes*2, kernel_size=1, stride=1, padding=0, bias=False),
-                                        BatchNorm(planes*2),
-                                        nn.ReLU(inplace=True)
-            )
-            self.h_size = 4
-            self.w_size = 4
-
-            self.conv_bcf = nn.Sequential(
-                                        nn.Conv2d(planes*4 + 2 , planes*2, kernel_size=1, stride=1, padding=0, bias=False),
-                                        BatchNorm(planes*2)
-            )
-    def forward(self, context, boundary):
-        _,_,x_h,x_w = context.size()
-        context = F.interpolate(self.conv_resize(context), size = [x_h * self.h_size, x_w * self.w_size], mode='bilinear', align_corners=False)
-        context = torch.cat([context,boundary], dim=1)
-        context = self.addcoords(context)
-        context = self.conv_bcf(context)
-        
-        return context
-
-class D_BCF(nn.Module):
-    def __init__(self, stage, planes, BatchNorm=nn.BatchNorm2d):
-        super(D_BCF,self).__init__()
-
-        self.addcoords = AddCoords(with_r = False)
-
-        if stage==3:
-            self.conv_bcf = nn.Sequential(
-                                        nn.Conv2d(planes*3 + 2, planes*4, kernel_size=3, stride=2, padding=1, bias=False),
-                                        BatchNorm(planes*4)
-            )
-
-        else:
-            self.conv_bcf = nn.Sequential(
-                                        nn.Conv2d(planes*4 + 2, planes*4, kernel_size=3, stride=2, padding=1, bias=False),
-                                        BatchNorm(planes*4),
-                                        nn.ReLU(inplace=True),
-                                        nn.Conv2d(planes*4, planes*8, kernel_size=3, stride=2, padding=1, bias=False),
-                                        BatchNorm(planes*8)
-            )
-
-    def forward(self, detail, boundary):
-
-        detail = torch.cat([detail,boundary], dim=1)
-        detail = self.addcoords(detail)
-        detail = self.conv_bcf(detail)
-
-        return detail
-
+    
+    def initialize(self):
+        weight_init(self)
 
 class Light_Bag(nn.Module):
     def __init__(self, in_channels, out_channels, BatchNorm=nn.BatchNorm2d):
@@ -457,6 +559,8 @@ class Light_Bag(nn.Module):
         
         return p_add + i_add
     
+    def initialize(self):
+        weight_init(self)
 
 class DDFMv2(nn.Module):
     def __init__(self, in_channels, out_channels, BatchNorm=nn.BatchNorm2d):
@@ -484,6 +588,9 @@ class DDFMv2(nn.Module):
         
         return p_add + i_add
 
+    def initialize(self):
+        weight_init(self)
+
 class Bag(nn.Module):
     def __init__(self, in_channels, out_channels, BatchNorm=nn.BatchNorm2d):
         super(Bag, self).__init__()
@@ -500,14 +607,17 @@ class Bag(nn.Module):
         edge_att = torch.sigmoid(d)
         return self.conv(edge_att*p + (1-edge_att)*i)
     
-
+    def initialize(self):
+        weight_init(self)
 
 if __name__ == '__main__':
 
-    
+    print(torch.__version__)
+    print(torchvision.__version__)
     x = torch.rand(4, 64, 32, 64).cuda()
     y = torch.rand(4, 64, 32, 64).cuda()
     z = torch.rand(4, 64, 32, 64).cuda()
-    net = PagFM(64, 16, with_channel=True).cuda()
+    net = Detail_Attn(64, 64, 64, 64, 4).cuda()
     
-    out = net(x,y)
+    net.initialize()
+    out = net(x, y)

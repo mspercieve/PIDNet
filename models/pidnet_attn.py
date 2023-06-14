@@ -5,20 +5,25 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import time
-from model_utils_BCF3 import BasicBlock, Bottleneck, segmenthead, DAPPM, PAPPM, PagFM, Bag, Light_Bag, C_BCF, D_BCF, AddCoords
+try:
+    from .model_utils_attn import BasicBlock, Bottleneck, segmenthead, DAPPM, PAPPM, Bag, Light_Bag, Detail_Attn
+except:
+    from model_utils_attn import BasicBlock, Bottleneck, segmenthead, DAPPM, PAPPM, Bag, Light_Bag, Detail_Attn
 import logging
 import sys
-
+sys.path.append("/home/mvpserverone/minseok/pytorch-receptive-field")
+print(sys.path)
+from torch_receptive_field import receptive_field
 BatchNorm2d = nn.BatchNorm2d
 bn_mom = 0.1
 algc = False
 
 
 
-class PIDNet_bcf3(nn.Module):
+class PIDNet_Attn(nn.Module):
 
     def __init__(self, m=2, n=3, num_classes=19, planes=64, ppm_planes=96, head_planes=128, augment=True):
-        super(PIDNet_bcf3, self).__init__()
+        super(PIDNet_Attn, self).__init__()
         self.augment = augment
         
         # I Branch
@@ -39,13 +44,18 @@ class PIDNet_bcf3(nn.Module):
         self.layer5 =  self._make_layer(Bottleneck, planes * 8, planes * 8, 2, stride=2)
         
         # P Branch
-
-
-        self.BCF3c = C_BCF(planes= planes, stage=3)
-        self.BCF3d = D_BCF(planes= planes, stage=3)
-        self.BCF4c = C_BCF(planes= planes, stage=4)
-        self.BCF4d = D_BCF(planes= planes, stage=4)
-
+        self.compression3 = nn.Sequential(
+                                          nn.Conv2d(planes * 4, planes * 2, kernel_size=1, bias=False),
+                                          BatchNorm2d(planes * 2, momentum=bn_mom),
+                                          )
+        self.compression4 = nn.Sequential(
+                                          nn.Conv2d(planes * 8, planes * 2, kernel_size=1, bias=False),
+                                          BatchNorm2d(planes * 2, momentum=bn_mom),
+                                        )
+        
+        self.dfm3 = Detail_Attn(in_ch = planes * 2, out_ch = planes * 2, inter_ch = planes * 2, attn_dim = planes * 2, num_head = 8)
+        self.dfm4 = Detail_Attn(in_ch = planes * 2, out_ch = planes * 2, inter_ch = planes * 2, attn_dim = planes * 2, num_head = 8)
+        
         self.layer3_ = self._make_layer(BasicBlock, planes * 2, planes * 2, m)
         self.layer4_ = self._make_layer(BasicBlock, planes * 2, planes * 2, m)
         self.layer5_ = self._make_layer(Bottleneck, planes * 2, planes * 2, 1)
@@ -134,45 +144,40 @@ class PIDNet_bcf3(nn.Module):
         width_output = x.shape[-1] // 8
         height_output = x.shape[-2] // 8
 
-        layers=[]
-        
-        #Stage 1,2
         x = self.conv1(x)
         x = self.layer1(x)
         x = self.relu(self.layer2(self.relu(x)))
-
-        #Stage 3
+        x_ = self.layer3_(x)
+        x_d = self.layer3_d(x)
         
-
-        x_ = self.layer3_(x) # detail-stage3    
-
-        x_d = self.layer3_d(x) # boundary-stage3
+        x = self.relu(self.layer3(x))
+        compressed_x3 = F.interpolate(self.compression3(x),
+                                        size=[height_output, width_output],
+                                        mode='bilinear', align_corners=algc)
         
-        x = self.relu(self.layer3(x)) # context-stage3
-        layers.append(x)
-        layers.append(x_)
-
-        x = layers[0] + self.BCF3d(layers[1], x_d) # context = context + detail'
-        x_ = layers[1] + self.BCF3c(layers[0], x_d) # detail = detail + context'
-
+        x_ = self.dfm3(compressed_x3, x_)
+        x_d = x_d + F.interpolate(
+                        self.diff3(x),
+                        size=[height_output, width_output],
+                        mode='bilinear', align_corners=algc)
         if self.augment:
             temp_p = x_
         
-        #Stage 4
-        x = self.relu(self.layer4(x)) # context-stage4
-        layers.append(x)
-
-        x_ = self.layer4_(self.relu(x_)) # detail-stage4
-        layers.append(x_)
-
-        x_d = self.layer4_d(self.relu(x_d)) #boundary- stage4
-        
-        x = layers[2] + self.BCF4d(layers[3], x_d) # context = context + detail'
-        x_ = layers[3] + self.BCF4c(layers[2], x_d) # detail = detail + context'
-
-        temp_d = x_d
-        
-        #Stage 5
+        x = self.relu(self.layer4(x))
+        compressed_x4 = F.interpolate(self.compression4(x),
+                                     size=[height_output, width_output],
+                                     mode='bilinear', align_corners=algc)
+        x_ = self.layer4_(self.relu(x_))
+        x_ = self.dfm4(compressed_x4, x_)
+        x_d = self.layer4_d(self.relu(x_d))
+        #x_ = self.pag4(x_, self.compression4(x))
+        x_d = x_d + F.interpolate(
+                        self.diff4(x),
+                        size=[height_output, width_output],
+                        mode='bilinear', align_corners=algc)
+        if self.augment:
+            temp_d = x_d
+            
         x_ = self.layer5_(self.relu(x_))
         x_d = self.layer5_d(self.relu(x_d))
         x = F.interpolate(
@@ -192,11 +197,11 @@ class PIDNet_bcf3(nn.Module):
 def get_seg_model(cfg, imgnet_pretrained):
     
     if 's' in cfg.MODEL.NAME:
-        model = PIDNet_bcf3(m=2, n=3, num_classes=cfg.DATASET.NUM_CLASSES, planes=32, ppm_planes=96, head_planes=128, augment=True)
+        model = PIDNet_Attn(m=2, n=3, num_classes=cfg.DATASET.NUM_CLASSES, planes=32, ppm_planes=96, head_planes=128, augment=True)
     elif 'm' in cfg.MODEL.NAME:
-        model = PIDNet_bcf3(m=2, n=3, num_classes=cfg.DATASET.NUM_CLASSES, planes=64, ppm_planes=96, head_planes=128, augment=True)
+        model = PIDNet_Attn(m=2, n=3, num_classes=cfg.DATASET.NUM_CLASSES, planes=64, ppm_planes=96, head_planes=128, augment=True)
     else:
-        model = PIDNet_bcf3(m=3, n=4, num_classes=cfg.DATASET.NUM_CLASSES, planes=64, ppm_planes=112, head_planes=256, augment=True)
+        model = PIDNet_Attn(m=3, n=4, num_classes=cfg.DATASET.NUM_CLASSES, planes=64, ppm_planes=112, head_planes=256, augment=True)
     
     if imgnet_pretrained:
         pretrained_state = torch.load(cfg.MODEL.PRETRAINED, map_location='cpu')['state_dict'] 
@@ -226,11 +231,11 @@ def get_seg_model(cfg, imgnet_pretrained):
 def get_pred_model(name, num_classes):
     
     if 's' in name:
-        model = PIDNet_bcf3(m=2, n=3, num_classes=num_classes, planes=32, ppm_planes=96, head_planes=128, augment=False)
+        model = PIDNet_Attn(m=2, n=3, num_classes=num_classes, planes=32, ppm_planes=96, head_planes=128, augment=False)
     elif 'm' in name:
-        model = PIDNet_bcf3(m=2, n=3, num_classes=num_classes, planes=64, ppm_planes=96, head_planes=128, augment=False)
+        model = PIDNet_Attn(m=2, n=3, num_classes=num_classes, planes=64, ppm_planes=96, head_planes=128, augment=False)
     else:
-        model = PIDNet_bcf3(m=3, n=4, num_classes=num_classes, planes=64, ppm_planes=112, head_planes=256, augment=False)
+        model = PIDNet_Attn(m=3, n=4, num_classes=num_classes, planes=64, ppm_planes=112, head_planes=256, augment=False)
     
     return model
 
@@ -238,13 +243,16 @@ if __name__ == '__main__':
     
     # Comment batchnorms here and in model_utils before testing speed since the batchnorm could be integrated into conv operation
     # (do not comment all, just the batchnorm following its corresponding conv layer)
-    sys.path.append('/home/mvpserverfive/minseok/PIDNet/models/')
-    device = torch.device('cuda')
+    device = torch.device('cuda:0')
+    #model = get_pred_model(name='pidnet_s', num_classes=19)
     model = get_pred_model(name='pidnet_s', num_classes=19)
     model.eval()
     model.to(device)
     iterations = None
     
+    #receptive_field_dict = receptive_field(model, (3, 256, 256))
+    #receptive_field_for_unit(receptive_field_dict, "2", (1,1))
+
     input = torch.randn(1, 3, 1024, 2048).cuda()
     with torch.no_grad():
         for _ in range(10):

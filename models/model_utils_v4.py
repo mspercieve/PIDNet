@@ -276,7 +276,7 @@ class FSM(nn.Module):
                                     nn.Conv2d(c_ch, dim, kernel_size=1, bias=False),
                                     nn.BatchNorm2d(dim)
                                     )
-        self.conv_fuse = nn.Conv2d(dim * 2, dim, kernel_size=1, bias=False)
+        self.conv_fuse = nn.Conv2d(dim * 2, dim * 2 , kernel_size=1, bias=False)
         self.conv_fuse_c = nn.Sequential(
                                     nn.Conv2d(dim, d_ch, kernel_size=3, stride=1, padding=1, bias=False),
                                     nn.BatchNorm2d(d_ch)
@@ -299,8 +299,9 @@ class FSM(nn.Module):
         c_resize = F.interpolate(self.conv_c(c), size = [H,W], mode='bilinear', align_corners = False)
         d_resize = self.conv_d(d)
         fuse_score = torch.sigmoid(self.conv_fuse(torch.cat([c_resize, d_resize],dim=1)))
-        c_resize = c_resize * fuse_score
-        d_resize = d_resize * fuse_score
+        fuse_score_c, fuse_score_d = torch.chunk(fuse_score, 2, dim=1)
+        c_resize = c_resize * fuse_score_c
+        d_resize = d_resize * fuse_score_d
 
         d_ff = self.conv_fuse_c(c_resize)
         c_ff = self.conv_fuse_d(d_resize)

@@ -1,7 +1,6 @@
 # ------------------------------------------------------------------------------
 # Written by Jiacong Xu (jiacong.xu@tamu.edu)
 # ------------------------------------------------------------------------------
-from unittest import result
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -311,110 +310,52 @@ class PagFM(nn.Module):
         x = (1-sim_map)*x + sim_map*y
         
         return x
-
-
-class AddCoords(nn.Module):
-
-    def __init__(self, with_r=False):
-        super().__init__()
-        self.with_r = with_r
-
-    def forward(self, input_tensor):
-        """
-        Args:
-            input_tensor: shape(batch, channel, x_dim, y_dim)
-        """
-        batch_size, _, x_dim, y_dim = input_tensor.size()
-
-        xx_channel = torch.arange(x_dim).repeat(1, y_dim, 1)
-        yy_channel = torch.arange(y_dim).repeat(1, x_dim, 1).transpose(1, 2)
-
-        xx_channel = xx_channel.float() / (x_dim - 1)
-        yy_channel = yy_channel.float() / (y_dim - 1)
-
-        xx_channel = xx_channel * 2 - 1
-        yy_channel = yy_channel * 2 - 1
-
-        xx_channel = xx_channel.repeat(batch_size, 1, 1, 1).transpose(2, 3)
-        yy_channel = yy_channel.repeat(batch_size, 1, 1, 1).transpose(2, 3)
-
-        ret = torch.cat([
-            input_tensor,
-            xx_channel.type_as(input_tensor),
-            yy_channel.type_as(input_tensor)], dim=1)
-
-        if self.with_r:
-            rr = torch.sqrt(torch.pow(xx_channel.type_as(input_tensor) - 0.5, 2) + torch.pow(yy_channel.type_as(input_tensor) - 0.5, 2))
-            ret = torch.cat([ret, rr], dim=1)
-
-        return ret
-
-
-class C_BCF(nn.Module):
-    def __init__(self, planes, stage, BatchNorm=nn.BatchNorm2d):
-        super(C_BCF, self).__init__()
+    
+class PagFM_ch(nn.Module):
+    def __init__(self, in_channels, mid_channels, after_relu=False, with_channel=False, BatchNorm=nn.BatchNorm2d):
+        super(PagFM_ch, self).__init__()
+        self.with_channel = with_channel
+        self.after_relu = after_relu
+        self.f_x = nn.Sequential(
+                                nn.Conv2d(in_channels, mid_channels, 
+                                          kernel_size=1, bias=False),
+                                BatchNorm(mid_channels)
+                                )
+        self.f_y = nn.Sequential(
+                                nn.Conv2d(in_channels, mid_channels, 
+                                          kernel_size=1, bias=False),
+                                BatchNorm(mid_channels)
+                                )
+        if with_channel:
+            self.up = nn.Sequential(
+                                    nn.Conv2d(mid_channels, in_channels, 
+                                              kernel_size=1, bias=False),
+                                    BatchNorm(in_channels)
+                                   )
+        if after_relu:
+            self.relu = nn.ReLU(inplace=True)
         
-
-        if stage == 3:
-            self.conv_resize = nn.Sequential(
-                                        nn.Conv2d(planes*4, planes*2, kernel_size=1, stride=1, padding=0, bias=False),
-                                        BatchNorm(planes*2),
-                                        nn.ReLU(inplace=True)
-                                        )
-            self.h_size = 2
-            self.w_size = 2
-
-            self.conv_bcf = nn.Sequential(
-                                        nn.Conv2d(planes*3, planes*2, kernel_size=1, stride=1, padding=0, bias=False),
-                                        BatchNorm(planes*2)
-            )
-        else:
-            self.conv_resize = nn.Sequential(
-                                        nn.Conv2d(planes*8, planes*2, kernel_size=1, stride=1, padding=0, bias=False),
-                                        BatchNorm(planes*2),
-                                        nn.ReLU(inplace=True)
-            )
-            self.h_size = 4
-            self.w_size = 4
-
-            self.conv_bcf = nn.Sequential(
-                                        nn.Conv2d(planes*4, planes*2, kernel_size=1, stride=1, padding=0, bias=False),
-                                        BatchNorm(planes*2)
-            )
-    def forward(self, context, boundary):
-        _,_,x_h,x_w = context.size()
-        context = F.interpolate(self.conv_resize(context), size = [x_h * self.h_size, x_w * self.w_size], mode='bilinear', align_corners=False)
-        context = torch.cat([context,boundary], dim=1)
-        context = self.conv_bcf(context)
+    def forward(self, x, y):
+        input_size = x.size()
+        if self.after_relu:
+            y = self.relu(y)
+            x = self.relu(x)
         
-        return context
-
-class D_BCF(nn.Module):
-    def __init__(self, stage, planes, BatchNorm=nn.BatchNorm2d):
-        super(D_BCF,self).__init__()
-
-        if stage==3:
-            self.conv_bcf = nn.Sequential(
-                                        nn.Conv2d(planes*3, planes*4, kernel_size=3, stride=2, padding=1, bias=False),
-                                        BatchNorm(planes*4)
-            )
-
+        y_q = self.f_y(y)
+        y_q = F.interpolate(y_q, size=[input_size[2], input_size[3]],
+                            mode='bilinear', align_corners=False)
+        x_k = self.f_x(x)
+        
+        if self.with_channel:
+            sim_map = torch.sigmoid(self.up(x_k * y_q))
         else:
-            self.conv_bcf = nn.Sequential(
-                                        nn.Conv2d(planes*4, planes*4, kernel_size=3, stride=2, padding=1, bias=False),
-                                        BatchNorm(planes*4),
-                                        nn.ReLU(inplace=True),
-                                        nn.Conv2d(planes*4, planes*8, kernel_size=3, stride=2, padding=1, bias=False),
-                                        BatchNorm(planes*8)
-            )
-
-    def forward(self, detail, boundary):
-
-        detail = torch.cat([detail,boundary], dim=1)
-        detail = self.conv_bcf(detail)
-
-        return detail
-
+            sim_map = torch.sigmoid(torch.sum(x_k * y_q, dim=1).unsqueeze(1))
+        
+        y = F.interpolate(y, size=[input_size[2], input_size[3]],
+                            mode='bilinear', align_corners=False)
+        x = (1-sim_map)*x + sim_map*y
+        
+        return x
 
 class Light_Bag(nn.Module):
     def __init__(self, in_channels, out_channels, BatchNorm=nn.BatchNorm2d):

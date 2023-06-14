@@ -5,7 +5,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import time
-from .model_utils import BasicBlock, Bottleneck, segmenthead, DAPPM, PAPPM, PagFM, Bag, Light_Bag
+try:
+    from .model_utils import BasicBlock, Bottleneck, segmenthead, DAPPM, PAPPM, PagFM, Bag, Light_Bag
+except:
+    from model_utils import BasicBlock, Bottleneck, segmenthead, DAPPM, PAPPM, PagFM, Bag, Light_Bag
 import logging
 
 BatchNorm2d = nn.BatchNorm2d
@@ -47,8 +50,8 @@ class PIDNet(nn.Module):
                                           nn.Conv2d(planes * 8, planes * 2, kernel_size=1, bias=False),
                                           BatchNorm2d(planes * 2, momentum=bn_mom),
                                           )
-        self.pag3 = PagFM(planes * 2, planes)
-        self.pag4 = PagFM(planes * 2, planes)
+        self.pag3 = PagFM(planes * 2, planes, with_channel=True)
+        self.pag4 = PagFM(planes * 2, planes, with_channel=True)
 
         self.layer3_ = self._make_layer(BasicBlock, planes * 2, planes * 2, m)
         self.layer4_ = self._make_layer(BasicBlock, planes * 2, planes * 2, m)
@@ -232,7 +235,7 @@ if __name__ == '__main__':
     # (do not comment all, just the batchnorm following its corresponding conv layer)
     device = torch.device('cuda:0')
     #model = get_pred_model(name='pidnet_s', num_classes=19)
-    model = get_pred_model(name='pidnet_l', num_classes=19)
+    model = get_pred_model(name='pidnet_s', num_classes=19)
     model.eval()
     model.to(device)
     iterations = None

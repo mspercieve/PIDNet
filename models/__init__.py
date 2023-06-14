@@ -6,4 +6,5 @@ from __future__ import division
 from __future__ import print_function
 
 import models.pidnet
-import models.pidnet_ms
+import models.pidnet_v4
+import models.pidnet_attn
